@@ -28,6 +28,7 @@
 #include "movegen.h"
 #include "movepick.h"
 #include "partner.h"
+#include "lifechess_draw.h"
 #include "position.h"
 #include "search.h"
 #include "thread.h"
@@ -59,6 +60,11 @@ using Eval::evaluate;
 using namespace Search;
 
 namespace {
+
+  int lifechess_material_phase(const Position& pos) {
+      return std::min(24, 4 * pos.count<QUEEN>() + 2 * pos.count<ROOK>()
+                           + pos.count<BISHOP>() + pos.count<KNIGHT>());
+  }
 
   // Different node types, used as a template parameter
   enum NodeType { NonPV, PV, Root };
@@ -190,7 +196,8 @@ void MainThread::search() {
 
   Eval::NNUE::verify();
 
-  if (rootMoves.empty() || (CurrentProtocol == XBOARD && rootPos.is_optional_game_end()))
+  if (rootMoves.empty() || (CurrentProtocol == XBOARD && !rootPos.variant()->lifeDrawClaims
+                            && rootPos.is_optional_game_end()))
   {
       rootMoves.emplace_back(MOVE_NONE);
       Value variantResult;
@@ -260,6 +267,91 @@ void MainThread::search() {
   // Send again PV info if we have a new best thread
   if (bestThread != this)
       sync_cout << UCI::pv(bestThread->rootPos, bestThread->completedDepth, -VALUE_INFINITE, VALUE_INFINITE) << sync_endl;
+
+  if (rootPos.variant()->lifeDrawClaims && !Limits.infinite && !ponder
+      && !Threads.abort && bestThread->rootMoves[0].pv[0] != MOVE_NONE)
+  {
+      Value score = bestThread->rootMoves[0].score;
+
+      if (CurrentProtocol == XBOARD && !Options["UCI_AnalyseMode"])
+      {
+          bool opponentOffered = XBoard::stateMachine->consume_draw_offer();
+          bool claimable = rootPos.is_optional_game_end();
+          bool repetitionClaim = claimable && rootPos.state()->repetition != 0;
+          bool fiftyMovesClaim = claimable && rootPos.rule50_count() >= 100;
+          bool alreadyOffered = XBoard::stateMachine->draw_offer_sent();
+          Value offerThreshold = LifeChess::draw_score_threshold(lifechess_material_phase(rootPos));
+          LifeChess::DrawDecision decision = LifeChess::draw_decision(
+              score, opponentOffered, claimable, alreadyOffered, false,
+              offerThreshold, rootPos.lifechess_bare_kings_claimable(),
+              LifeChess::draw_offer_is_stable(score, offerThreshold,
+                                               bestThread->completedDepth));
+
+          if (score > VALUE_DRAW)
+              XBoard::stateMachine->reset_draw_offer_latch();
+
+          if (decision == LifeChess::DrawDecision::Claim)
+          {
+              sync_cout << "1/2-1/2 {Draw claimed: "
+                        << LifeChess::claim_reason(repetitionClaim, fiftyMovesClaim)
+                        << "}" << sync_endl;
+              XBoard::stateMachine->moveAfterSearch = false;
+              return;
+          }
+          if (decision == LifeChess::DrawDecision::ClaimBareKings)
+          {
+              sync_cout << "1/2-1/2 {Bare kings draw claimed}" << sync_endl;
+              XBoard::stateMachine->moveAfterSearch = false;
+              return;
+          }
+          if (decision == LifeChess::DrawDecision::Accept)
+          {
+              sync_cout << "offer draw" << sync_endl;
+              XBoard::stateMachine->moveAfterSearch = false;
+              return;
+          }
+          if (decision == LifeChess::DrawDecision::Offer)
+          {
+              sync_cout << "offer draw" << sync_endl;
+              XBoard::stateMachine->mark_draw_offer_sent();
+          }
+      }
+      else if (CurrentProtocol == UCI_GENERAL && Options["LifeChess Draw Decisions"]
+               && !Options["UCI_AnalyseMode"])
+      {
+          bool repetitionClaim = bool(Options["LifeChess Draw Claim Repetition"]);
+          bool fiftyMovesClaim = bool(Options["LifeChess Draw Claim Fifty Moves"]);
+          bool claimable = bool(Options["LifeChess Draw Claim Available"])
+                        || repetitionClaim || fiftyMovesClaim;
+          Value offerThreshold = LifeChess::draw_score_threshold(lifechess_material_phase(rootPos));
+          LifeChess::DrawDecision decision = LifeChess::draw_decision(
+              score, bool(Options["LifeChess Draw Offer Pending"]),
+              claimable,
+              bool(Options["LifeChess Draw Offer Sent"]), false,
+              offerThreshold, rootPos.lifechess_bare_kings_claimable(),
+              LifeChess::draw_offer_is_stable(score, offerThreshold,
+                                               bestThread->completedDepth));
+          const char* action = "continue";
+          const char* reason = "none";
+          if (decision == LifeChess::DrawDecision::Claim)
+          {
+              action = repetitionClaim ? "claim_repetition"
+                     : fiftyMovesClaim ? "claim_fifty_moves" : "claim";
+              reason = LifeChess::claim_reason(repetitionClaim, fiftyMovesClaim);
+          }
+          else if (decision == LifeChess::DrawDecision::Accept) { action = "accept"; reason = "opponent_offer"; }
+          else if (decision == LifeChess::DrawDecision::Decline) { action = "decline"; reason = "winning_continuation"; }
+          else if (decision == LifeChess::DrawDecision::Offer) { action = "offer"; reason = "score_threshold"; }
+          else if (decision == LifeChess::DrawDecision::ClaimBareKings) { action = "claim_bare_kings"; reason = "bare_kings"; }
+          sync_cout << "info string lifechess-action " << action
+                    << " reason " << reason << " score " << score
+                    << ((score >= VALUE_MATE_IN_MAX_PLY || score <= VALUE_MATED_IN_MAX_PLY)
+                            ? " scoreType=mate" : " scoreType=cp")
+                    << " perspective=side_to_move threshold " << offerThreshold
+                    << (score > VALUE_DRAW ? " reset-offer-latch" : "")
+                    << sync_endl;
+      }
+  }
 
   if (CurrentProtocol == XBOARD)
   {
@@ -701,7 +793,8 @@ namespace {
     priorCapture       = pos.captured_piece();
     Color us           = pos.side_to_move();
     moveCount          = captureCount = quietCount = ss->moveCount = 0;
-    bestValue          = -VALUE_INFINITE;
+    const bool bareKingsClaimable = !rootNode && pos.lifechess_bare_kings_claimable();
+    bestValue          = bareKingsClaimable ? VALUE_DRAW : -VALUE_INFINITE;
     maxValue           = VALUE_INFINITE;
 
     // Check for the available remaining time
@@ -781,6 +874,7 @@ namespace {
         && ss->ttHit
         && tte->depth() >= depth
         && ttValue != VALUE_NONE // Possible in case of TT access race
+        && !bareKingsClaimable
         && (ttValue >= beta ? (tte->bound() & BOUND_LOWER)
                             : (tte->bound() & BOUND_UPPER)))
     {
@@ -922,7 +1016,7 @@ namespace {
                : ss->staticEval > (ss-2)->staticEval;
 
     // Skip early pruning in case of mandatory capture
-    if (pos.must_capture() && pos.has_capture())
+    if ((pos.must_capture() && pos.has_capture()) || pos.life_debt_active())
         goto moves_loop;
 
     // Step 7. Futility pruning: child node (~50 Elo)
@@ -940,6 +1034,7 @@ namespace {
         &&  eval >= ss->staticEval
         &&  ss->staticEval >= beta - 20 * depth - 22 * improving + 168 * ss->ttPv + 159 + 200 * (!pos.double_step_region(pos.side_to_move()) && (pos.piece_types() & PAWN))
         && !excludedMove
+        && !pos.life_debt_active()
         &&  pos.non_pawn_material(us)
         &&  pos.count<ALL_PIECES>(~us) != pos.count<PAWN>(~us)
         && !pos.flip_enclosed_pieces()
@@ -1141,6 +1236,7 @@ moves_loop: // When in check, search starts from here
 
       // Step 13. Pruning at shallow depth (~200 Elo)
       if (  !rootNode
+          && !pos.life_debt_active()
           && (pos.non_pawn_material(us) || pos.count<ALL_PIECES>(us) == pos.count<PAWN>(us))
           && bestValue > VALUE_TB_LOSS_IN_MAX_PLY)
       {
@@ -1472,7 +1568,8 @@ moves_loop: // When in check, search starts from here
 
     if (!moveCount)
         bestValue = excludedMove ? alpha :
-                    ss->inCheck  ? pos.checkmate_value(ss->ply)
+                    (ss->inCheck || pos.life_debt_active())
+                                 ? pos.checkmate_value(ss->ply)
                                  : pos.stalemate_value(ss->ply);
 
     // If there is a move which produces search value greater than alpha we update stats of searched moves
@@ -1544,6 +1641,7 @@ moves_loop: // When in check, search starts from here
     Thread* thisThread = pos.this_thread();
     bestMove = MOVE_NONE;
     ss->inCheck = pos.checkers();
+    const bool bareKingsClaimable = pos.lifechess_bare_kings_claimable();
     moveCount = 0;
 
     Value gameResult;
@@ -1572,7 +1670,8 @@ moves_loop: // When in check, search starts from here
     ttMove = ss->ttHit ? tte->move() : MOVE_NONE;
     pvHit = ss->ttHit && tte->is_pv();
 
-    if (  !PvNode
+    if (  !bareKingsClaimable
+        && !PvNode
         && ss->ttHit
         && tte->depth() >= ttDepth
         && ttValue != VALUE_NONE // Only in case of TT access race
@@ -1586,7 +1685,7 @@ moves_loop: // When in check, search starts from here
         ss->staticEval = VALUE_NONE;
         bestValue = futilityBase = -VALUE_INFINITE;
     }
-    else
+    else if (!pos.life_debt_active())
     {
         if (ss->ttHit)
         {
@@ -1606,6 +1705,9 @@ moves_loop: // When in check, search starts from here
             (ss-1)->currentMove != MOVE_NULL ? evaluate(pos)
                                              : -(ss-1)->staticEval;
 
+        if (bareKingsClaimable)
+            bestValue = std::max(bestValue, VALUE_DRAW);
+
         // Stand pat. Return immediately if static value is at least beta
         if (bestValue >= beta)
         {
@@ -1621,6 +1723,13 @@ moves_loop: // When in check, search starts from here
             alpha = bestValue;
 
         futilityBase = bestValue + 155;
+    }
+    else
+    {
+        // An outstanding LifeChess debt requires a king capture; stand pat is
+        // not an available action in this state.
+        ss->staticEval = VALUE_NONE;
+        bestValue = futilityBase = -VALUE_INFINITE;
     }
 
     const PieceToHistory* contHist[] = { (ss-1)->continuationHistory, (ss-2)->continuationHistory,
@@ -1732,7 +1841,8 @@ moves_loop: // When in check, search starts from here
 
     // All legal moves have been searched. A special case: if we're in check
     // and no legal moves were found, it is checkmate.
-    if (ss->inCheck && bestValue == -VALUE_INFINITE)
+    if (bestValue == -VALUE_INFINITE
+        && (ss->inCheck || pos.life_debt_active()))
     {
         assert(!MoveList<LEGAL>(pos).size());
 
@@ -1982,7 +2092,8 @@ void MainThread::check_time() {
 
   if (   (Limits.use_time_management() && (elapsed > Time.maximum() - 10 || stopOnPonderhit))
       || (Limits.movetime && elapsed >= Limits.movetime)
-      || (Limits.nodes && Threads.nodes_searched() >= (uint64_t)Limits.nodes))
+      || (Limits.nodes && completedDepth > 0
+          && Threads.nodes_searched() >= (uint64_t)Limits.nodes))
       Threads.stop = true;
 }
 

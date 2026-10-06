@@ -51,6 +51,8 @@ struct StateInfo {
   int    pliesFromNull;
   int    countingPly;
   int    countingLimit;
+  Color  lifeDebtTargetKings;
+  Bitboard lifeMovedPawns;
   CheckCount checksRemaining[COLOR_NB];
   Bitboard epSquares;
   Square castlingKingSquare[COLOR_NB];
@@ -142,8 +144,10 @@ public:
   bool blast_on_capture() const;
   PieceSet blast_immune_types() const;
   PieceSet mutually_immune_types() const;
+  PieceSet own_capture_types() const;
   EndgameEval endgame_eval() const;
   Bitboard double_step_region(Color c) const;
+  Bitboard life_moved_pawns() const;
   Bitboard triple_step_region(Color c) const;
   bool castling_enabled() const;
   bool castling_dropped_piece() const;
@@ -260,6 +264,7 @@ public:
   CastlingRights castling_rights(Color c) const;
   bool can_castle(CastlingRights cr) const;
   bool castling_impeded(CastlingRights cr) const;
+  bool life_vertical_castling() const;
   Square castling_rook_square(CastlingRights cr) const;
 
   // Checking
@@ -282,6 +287,10 @@ public:
   // Properties of moves
   bool legal(Move m) const;
   bool pseudo_legal(const Move m) const;
+  bool life_king_promotion_allowed(Move m) const;
+  bool life_debt_active() const;
+  Color life_debt_target_kings() const;
+  bool lifechess_bare_kings_claimable() const;
   bool virtual_drop(Move m) const;
   bool capture(Move m) const;
   bool capture_or_promotion(Move m) const;
@@ -518,6 +527,11 @@ inline PieceSet Position::mutually_immune_types() const {
   return var->mutuallyImmuneTypes;
 }
 
+inline PieceSet Position::own_capture_types() const {
+  assert(var != nullptr);
+  return var->ownCaptureTypes;
+}
+
 inline EndgameEval Position::endgame_eval() const {
   assert(var != nullptr);
   return !count_in_hand(ALL_PIECES) && (var->endgameEval != EG_EVAL_CHESS || count<KING>() == 2) ? var->endgameEval : NO_EG_EVAL;
@@ -526,6 +540,10 @@ inline EndgameEval Position::endgame_eval() const {
 inline Bitboard Position::double_step_region(Color c) const {
   assert(var != nullptr);
   return var->doubleStepRegion[c];
+}
+
+inline Bitboard Position::life_moved_pawns() const {
+  return st->lifeMovedPawns;
 }
 
 inline Bitboard Position::triple_step_region(Color c) const {
@@ -1155,7 +1173,8 @@ inline bool Position::is_draw(int ply) const {
 }
 
 inline bool Position::is_game_end(Value& result, int ply) const {
-  return is_immediate_game_end(result, ply) || is_optional_game_end(result, ply);
+  return is_immediate_game_end(result, ply)
+      || (!var->lifeDrawClaims && is_optional_game_end(result, ply));
 }
 
 inline Color Position::side_to_move() const {
@@ -1253,7 +1272,15 @@ inline bool Position::is_on_semiopen_file(Color c, Square s) const {
 }
 
 inline bool Position::can_castle(CastlingRights cr) const {
-  return st->castlingRights & cr;
+  if (!(st->castlingRights & cr))
+      return false;
+  if (cr == WHITE_VERTICAL || cr == BLACK_VERTICAL)
+  {
+      Color c = cr == WHITE_VERTICAL ? WHITE : BLACK;
+      Piece rook = piece_on(castlingRookSquare[cr]);
+      return rook && color_of(rook) == c && (castling_rook_pieces(c) & type_of(rook));
+  }
+  return true;
 }
 
 inline CastlingRights Position::castling_rights(Color c) const {
@@ -1261,13 +1288,15 @@ inline CastlingRights Position::castling_rights(Color c) const {
 }
 
 inline bool Position::castling_impeded(CastlingRights cr) const {
-  assert(cr == WHITE_OO || cr == WHITE_OOO || cr == BLACK_OO || cr == BLACK_OOO);
+  assert(cr == WHITE_OO || cr == WHITE_OOO || cr == BLACK_OO || cr == BLACK_OOO
+      || cr == WHITE_VERTICAL || cr == BLACK_VERTICAL);
 
   return pieces() & castlingPath[cr];
 }
 
 inline Square Position::castling_rook_square(CastlingRights cr) const {
-  assert(cr == WHITE_OO || cr == WHITE_OOO || cr == BLACK_OO || cr == BLACK_OOO);
+  assert(cr == WHITE_OO || cr == WHITE_OOO || cr == BLACK_OO || cr == BLACK_OOO
+      || cr == WHITE_VERTICAL || cr == BLACK_VERTICAL);
 
   return castlingRookSquare[cr];
 }
@@ -1458,6 +1487,8 @@ inline Square Position::capture_square(Square to) const {
   {
       // The capture square of normal en passant is the closest piece behind the target square
       Bitboard epCandidates = pieces(~sideToMove) & forward_file_bb(~sideToMove, to);
+      if (!epCandidates)
+          return SQ_NONE;
       return sideToMove == WHITE ? msb(epCandidates) : lsb(epCandidates);
   }
 }
@@ -1548,6 +1579,34 @@ inline void Position::do_move(Move m, StateInfo& newSt) {
 inline StateInfo* Position::state() const {
 
   return st;
+}
+
+inline bool Position::life_debt_active() const {
+  return st->lifeDebtTargetKings < COLOR_NB;
+}
+
+inline Color Position::life_debt_target_kings() const {
+  return st->lifeDebtTargetKings;
+}
+
+inline bool Position::lifechess_bare_kings_claimable() const {
+  PieceType lifeKing = var->lifeKingPieceType;
+  if (!var->lifeDrawClaims || life_debt_active() || popcount(pieces()) != 2
+      || lifeKing == NO_PIECE_TYPE || count(WHITE, lifeKing) != 1
+      || count(BLACK, lifeKing) != 1)
+      return false;
+
+  Square whiteKing = square(WHITE, lifeKing);
+  Square blackKing = square(BLACK, lifeKing);
+  int fileDelta = int(file_of(whiteKing)) - int(file_of(blackKing));
+  int rankDelta = int(rank_of(whiteKing)) - int(rank_of(blackKing));
+  int fileDistance = fileDelta < 0 ? -fileDelta : fileDelta;
+  int rankDistance = rankDelta < 0 ? -rankDelta : rankDelta;
+  return std::max(fileDistance, rankDistance) > 1;
+}
+
+inline bool Position::life_vertical_castling() const {
+  return var->lifeVerticalCastling;
 }
 
 // Variant-specific

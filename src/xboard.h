@@ -20,6 +20,7 @@
 #define XBOARD_H_INCLUDED
 
 #include <algorithm>
+#include <atomic>
 #include <sstream>
 #include <string>
 
@@ -50,6 +51,10 @@ public:
   void undo_move();
   std::string highlight(std::string square);
   void process_command(std::string token, std::istringstream& is);
+  bool consume_draw_offer() { return drawOfferPending.exchange(false); }
+  bool draw_offer_sent() const { return drawOfferSent; }
+  void mark_draw_offer_sent() { drawOfferSent = true; }
+  void reset_draw_offer_latch() { drawOfferSent = false; }
   bool moveAfterSearch;
   Move ponderMove;
 
@@ -60,6 +65,8 @@ private:
   Search::LimitsType limits;
   Color playColor;
   std::string ponderHighlight;
+  std::atomic<bool> drawOfferPending{false};
+  bool drawOfferSent = false;
 };
 
 extern StateMachine* stateMachine;

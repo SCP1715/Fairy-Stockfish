@@ -740,6 +740,10 @@ inline std::string castling_rights_to_string(CastlingRights castlingRights) {
         return "BLACK_OO";
     case BLACK_OOO:
         return "BLACK_OOO";
+    case WHITE_VERTICAL:
+        return "WHITE_VERTICAL";
+    case BLACK_VERTICAL:
+        return "BLACK_VERTICAL";
     case WHITE_CASTLING:
         return "WHITE_CASTLING";
     case BLACK_CASTLING:

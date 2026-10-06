@@ -149,13 +149,21 @@ namespace {
 
     const Bitboard pawns      = pos.pieces(Us, PAWN);
     const Bitboard movable    = pos.board_bb(Us, PAWN) & ~pos.pieces();
-    const Bitboard capturable = pos.board_bb(Us, PAWN) &  pos.pieces(Them);
+    Bitboard capturable = pos.board_bb(Us, PAWN) & pos.pieces(Them);
+    if ((Type == CAPTURES || Type == EVASIONS || Type == NON_EVASIONS)
+        && (pos.own_capture_types() & PAWN))
+        capturable |= pos.board_bb(Us, PAWN) & pos.pieces(Us);
+    if ((Type == CAPTURES || Type == EVASIONS || Type == NON_EVASIONS)
+        && pos.life_debt_active())
+        capturable |= pos.pieces(pos.life_debt_target_kings(),
+                                 pos.variant()->lifeKingPieceType);
 
     target = Type == EVASIONS ? target : AllSquares;
 
     // Define single and double push, left and right capture, as well as respective promotion moves
     Bitboard b1 = shift<Up>(pawns) & movable & target;
-    Bitboard b2 = shift<Up>(shift<Up>(pawns & doubleStepRegion) & movable) & movable & target;
+    Bitboard b2 = shift<Up>(shift<Up>(pawns & doubleStepRegion
+                         & ~pos.life_moved_pawns()) & movable) & movable & target;
     Bitboard b3 = shift<Up>(shift<Up>(shift<Up>(pawns & tripleStepRegion) & movable) & movable) & movable & target;
     Bitboard brc = shift<UpRight>(pawns) & capturable & target;
     Bitboard blc = shift<UpLeft >(pawns) & capturable & target;
@@ -268,6 +276,9 @@ namespace {
         {
             Square epSquare = pop_lsb(epSquares);
 
+            if (pos.capture_square(epSquare) == SQ_NONE)
+                continue;
+
             // An en passant capture cannot resolve a discovered check (unless there non-sliding riders)
             if (Type == EVASIONS && (target & (epSquare + Up)) && !pos.non_sliding_riders())
                 return moveList;
@@ -365,7 +376,11 @@ namespace {
         // En passant captures
         if (Type == CAPTURES || Type == EVASIONS || Type == NON_EVASIONS)
             while (epSquares)
-                moveList = make_move_and_gating<EN_PASSANT>(pos, moveList, Us, from, pop_lsb(epSquares));
+            {
+                Square epSquare = pop_lsb(epSquares);
+                if (pos.capture_square(epSquare) != SQ_NONE)
+                    moveList = make_move_and_gating<EN_PASSANT>(pos, moveList, Us, from, epSquare);
+            }
     }
 
     return moveList;
@@ -389,6 +404,12 @@ namespace {
                : Type == CAPTURES     ?  pos.pieces(~Us)
                                       : ~pos.pieces(   ); // QUIETS || QUIET_CHECKS
 
+        if (pos.life_debt_active())
+            target = (Type == CAPTURES || Type == NON_EVASIONS || Type == EVASIONS)
+                   ? pos.pieces(pos.life_debt_target_kings(),
+                                pos.variant()->lifeKingPieceType)
+                   : Bitboard(0);
+
         if (Type == EVASIONS)
         {
             if (pos.checkers() & pos.non_sliding_riders())
@@ -404,7 +425,13 @@ namespace {
 
         moveList = generate_pawn_moves<Us, Type>(pos, moveList, target);
         for (PieceSet ps = pos.piece_types() & ~(piece_set(PAWN) | KING); ps;)
-            moveList = generate_moves<Us, Type>(pos, moveList, pop_lsb(ps), target);
+        {
+            PieceType pt = pop_lsb(ps);
+            Bitboard pieceTarget = target;
+            if ((Type == CAPTURES || Type == NON_EVASIONS) && (pos.own_capture_types() & pt))
+                pieceTarget |= pos.pieces(Us);
+            moveList = generate_moves<Us, Type>(pos, moveList, pt, pieceTarget);
+        }
         // generate drops
         if (pos.piece_drops() && Type != CAPTURES && (pos.can_drop(Us, ALL_PIECES) || pos.two_boards()))
             for (PieceSet ps = pos.piece_types(); ps;)
@@ -414,7 +441,7 @@ namespace {
         if (!pos.count<KING>(Us) && Type != CAPTURES && pos.can_castle(Us & ANY_CASTLING))
         {
             Square from = pos.castling_king_square(Us);
-            for(CastlingRights cr : { Us & KING_SIDE, Us & QUEEN_SIDE } )
+            for(CastlingRights cr : { Us & KING_SIDE, Us & QUEEN_SIDE, Us & VERTICAL_CASTLING } )
                 if (!pos.castling_impeded(cr) && pos.can_castle(cr))
                     moveList = make_move_and_gating<CASTLING>(pos, moveList, Us, from, pos.castling_rook_square(cr));
         }
@@ -455,8 +482,11 @@ namespace {
     // King moves
     if (pos.count<KING>(Us) && (!Checks || pos.blockers_for_king(~Us) & ksq))
     {
+        Bitboard kingTarget = target;
+        if ((Type == CAPTURES || Type == NON_EVASIONS) && (pos.own_capture_types() & KING))
+            kingTarget |= pos.pieces(Us);
         Bitboard b = (  (pos.attacks_from(Us, KING, ksq) & pos.pieces())
-                      | (pos.moves_from(Us, KING, ksq) & ~pos.pieces())) & (Type == EVASIONS ? ~pos.pieces(Us) : target);
+                      | (pos.moves_from(Us, KING, ksq) & ~pos.pieces())) & (Type == EVASIONS ? ~pos.pieces(Us) : kingTarget);
         while (b)
             moveList = make_move_and_gating<NORMAL>(pos, moveList, Us, ksq, pop_lsb(b));
 
@@ -465,7 +495,7 @@ namespace {
             *moveList++ = make<SPECIAL>(ksq, ksq);
 
         if ((Type == QUIETS || Type == NON_EVASIONS) && pos.can_castle(Us & ANY_CASTLING))
-            for (CastlingRights cr : { Us & KING_SIDE, Us & QUEEN_SIDE } )
+            for (CastlingRights cr : { Us & KING_SIDE, Us & QUEEN_SIDE, Us & VERTICAL_CASTLING } )
                 if (!pos.castling_impeded(cr) && pos.can_castle(cr))
                     moveList = make_move_and_gating<CASTLING>(pos, moveList, Us,ksq, pos.castling_rook_square(cr));
     }

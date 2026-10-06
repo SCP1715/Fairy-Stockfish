@@ -384,6 +384,7 @@ Variant* VariantParser<DoCheck>::parse(Variant* v) {
     parse_attribute("promotionPieceTypes", v->promotionPieceTypes[BLACK], v->pieceToChar);
     parse_attribute("promotionPieceTypesWhite", v->promotionPieceTypes[WHITE], v->pieceToChar);
     parse_attribute("promotionPieceTypesBlack", v->promotionPieceTypes[BLACK], v->pieceToChar);
+    parse_attribute("lifeKingPieceType", v->lifeKingPieceType, v->pieceToChar);
     parse_attribute("sittuyinPromotion", v->sittuyinPromotion);
     // promotion limit
     const auto& it_prom_limit = config.find("promotionLimit");
@@ -419,6 +420,7 @@ Variant* VariantParser<DoCheck>::parse(Variant* v) {
     parse_attribute("blastOnCapture", v->blastOnCapture);
     parse_attribute("blastImmuneTypes", v->blastImmuneTypes, v->pieceToChar);
     parse_attribute("mutuallyImmuneTypes", v->mutuallyImmuneTypes, v->pieceToChar);
+    parse_attribute("ownCaptureTypes", v->ownCaptureTypes, v->pieceToChar);
     parse_attribute("petrifyOnCaptureTypes", v->petrifyOnCaptureTypes, v->pieceToChar);
     parse_attribute("petrifyBlastPieces", v->petrifyBlastPieces);
     parse_attribute("doubleStep", v->doubleStep);
@@ -435,6 +437,8 @@ Variant* VariantParser<DoCheck>::parse(Variant* v) {
     parse_attribute("enPassantTypesWhite", v->enPassantTypes[WHITE], v->pieceToChar);
     parse_attribute("enPassantTypesBlack", v->enPassantTypes[BLACK], v->pieceToChar);
     parse_attribute("castling", v->castling);
+    parse_attribute("lifeVerticalCastling", v->lifeVerticalCastling);
+    parse_attribute("lifeDrawClaims", v->lifeDrawClaims);
     parse_attribute("castlingDroppedPiece", v->castlingDroppedPiece);
     parse_attribute("castlingKingsideFile", v->castlingKingsideFile);
     parse_attribute("castlingQueensideFile", v->castlingQueensideFile);
@@ -601,6 +605,8 @@ Variant* VariantParser<DoCheck>::parse(Variant* v) {
             std::cerr << "checkCounting=true requires checking=true." << std::endl;
         if (v->castling && v->castlingRank > v->maxRank)
             std::cerr << "Inconsistent settings: castlingRank > maxRank." << std::endl;
+        if (v->lifeVerticalCastling && !v->castling)
+            std::cerr << "lifeVerticalCastling=true requires castling=true." << std::endl;
         if (v->castling && v->castlingQueensideFile > v->castlingKingsideFile)
             std::cerr << "Inconsistent settings: castlingQueensideFile > castlingKingsideFile." << std::endl;
 
@@ -648,6 +654,18 @@ Variant* VariantParser<DoCheck>::parse(Variant* v) {
             errors.push_back("Can not use kings or pseudo-royal with blastImmuneTypes.");
         if (v->mutuallyImmuneTypes)
             errors.push_back("Can not use kings or pseudo-royal with mutuallyImmuneTypes.");
+    }
+    if (v->capturesToHand && v->ownCaptureTypes)
+        errors.push_back("Can not use capturesToHand with ownCaptureTypes.");
+    if (v->lifeKingPieceType != NO_PIECE_TYPE)
+    {
+        if (!(v->pieceTypes & v->lifeKingPieceType))
+            errors.push_back("lifeKingPieceType must be an enabled piece type.");
+        if (!(v->ownCaptureTypes & v->lifeKingPieceType))
+            errors.push_back("lifeKingPieceType must be included in ownCaptureTypes.");
+        for (Color c : { WHITE, BLACK })
+            if (!(v->promotionPieceTypes[c] & v->lifeKingPieceType))
+                errors.push_back("lifeKingPieceType must be a promotion option for both sides.");
     }
     if (v->flagPieceSafe && v->blastOnCapture)
         errors.push_back("Can not use flagPieceSafe with blastOnCapture (flagPieceSafe uses simple assessment that does not see blast).");

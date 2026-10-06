@@ -44,6 +44,8 @@ namespace Zobrist {
   Key side, noPawns;
   Key inHand[PIECE_NB][SQUARE_NB];
   Key checks[COLOR_NB][CHECKS_NB];
+  Key lifeDebt[COLOR_NB];
+  Key lifeMovedPawn[SQUARE_NB];
   Key wall[SQUARE_NB];
   Key endgame[EG_EVAL_NB];
 }
@@ -172,6 +174,11 @@ void Position::init() {
 
   Zobrist::side = rng.rand<Key>();
   Zobrist::noPawns = rng.rand<Key>();
+  for (Color c : {WHITE, BLACK})
+      Zobrist::lifeDebt[c] = rng.rand<Key>();
+
+  for (Square s = SQ_A1; s <= SQ_MAX; ++s)
+      Zobrist::lifeMovedPawn[s] = rng.rand<Key>();
 
   for (Color c : {WHITE, BLACK})
       for (int n = 0; n < CHECKS_NB; ++n)
@@ -273,6 +280,7 @@ Position& Position::set(const Variant* v, const string& fenStr, bool isChess960,
   std::memset(this, 0, sizeof(Position));
   std::memset(si, 0, sizeof(StateInfo));
   st = si;
+  st->lifeDebtTargetKings = Color(COLOR_NB);
 
   var = v;
 
@@ -364,10 +372,14 @@ Position& Position::set(const Variant* v, const string& fenStr, bool isChess960,
       {
           Square rsq;
           Color c = islower(token) ? BLACK : WHITE;
+          bool verticalCastlingToken = v->lifeVerticalCastling && (token == 'V' || token == 'v');
 
           token = char(toupper(token));
 
-          if (castling_enabled() && token == 'K')
+          if (verticalCastlingToken)
+              rsq = make_square(v->castlingKingFile, c == WHITE ? RANK_8 : RANK_1);
+
+          else if (castling_enabled() && token == 'K')
               for (rsq = make_square(var->castlingRookKingsideFile, castling_rank(c)); (!(castling_rook_pieces(c) & type_of(piece_on(rsq))) || color_of(piece_on(rsq)) != c) && file_of(rsq) > FILE_A; --rsq) {}
 
           else if (castling_enabled() && token == 'Q')
@@ -407,10 +419,13 @@ Position& Position::set(const Variant* v, const string& fenStr, bool isChess960,
                   continue;
           }
 
-          // Only add castling right if both king and rook are on expected squares
+          // LifeChess vertical rights survive before a promoted rook reaches
+          // the opposite home square. Other rights still require their rook.
           if (   castling_enabled()
               && st->castlingKingSquare[c] != SQ_NONE
-              && (castling_rook_pieces(c) & type_of(piece_on(rsq))) && color_of(piece_on(rsq)) == c)
+              && (verticalCastlingToken
+                  || ((castling_rook_pieces(c) & type_of(piece_on(rsq)))
+                      && color_of(piece_on(rsq)) == c)))
               set_castling_right(c, rsq);
       }
 
@@ -519,6 +534,34 @@ Position& Position::set(const Variant* v, const string& fenStr, bool isChess960,
       // Convert from fullmove starting from 1 to gamePly starting from 0,
       // handle also common incorrect FEN with fullmove = 0.
       gamePly = std::max(2 * (gamePly - 1), 0) + (sideToMove == BLACK);
+
+      // LifeChess state extension: lc1:-, lc1:w, or lc1:b.
+      ss.clear(ss.rdstate() & ~std::ios::failbit);
+      string lifeState;
+      if (ss >> lifeState)
+      {
+          if (lifeState == "lc1:w")
+              st->lifeDebtTargetKings = WHITE;
+          else if (lifeState == "lc1:b")
+              st->lifeDebtTargetKings = BLACK;
+          else if (lifeState != "lc1:-")
+              std::cerr << "Invalid LifeChess FEN state extension: " << lifeState << '\n';
+      }
+
+      string movedPawns;
+      if (ss >> movedPawns && movedPawns.compare(0, 4, "lm1:") == 0)
+      {
+          std::istringstream movedPawnsValue(movedPawns.substr(4));
+          unsigned long long movedPawnsBits = 0;
+          movedPawnsValue >> std::hex >> movedPawnsBits;
+          if (movedPawnsValue && movedPawnsValue.eof())
+              st->lifeMovedPawns = Bitboard(movedPawnsBits);
+          else
+          {
+              std::cerr << "Invalid LifeChess moved-pawn FEN extension: " << movedPawns << '\n';
+              st->lifeMovedPawns = 0;
+          }
+      }
   }
 
   // counting rules
@@ -558,15 +601,23 @@ void Position::set_castling_right(Color c, Square rfrom) {
 
   assert(st->castlingKingSquare[c] != SQ_NONE);
   Square kfrom = st->castlingKingSquare[c];
-  CastlingRights cr = c & (kfrom < rfrom ? KING_SIDE: QUEEN_SIDE);
+  bool vertical = var->lifeVerticalCastling && file_of(kfrom) == file_of(rfrom);
+  CastlingRights cr = vertical ? (c == WHITE ? WHITE_VERTICAL : BLACK_VERTICAL)
+                               : c & (kfrom < rfrom ? KING_SIDE: QUEEN_SIDE);
 
   st->castlingRights |= cr;
   castlingRightsMask[kfrom] |= cr;
-  castlingRightsMask[rfrom] |= cr;
+  // A vertical rook starts on the other side's king home square. Do not let
+  // that king's move consume this right; vertical-right changes are tracked by
+  // the moving/captured piece and color in do_move().
+  if (!vertical)
+      castlingRightsMask[rfrom] |= cr;
   castlingRookSquare[cr] = rfrom;
 
-  Square kto = make_square(cr & KING_SIDE ? castling_kingside_file() : castling_queenside_file(), castling_rank(c));
-  Square rto = kto + (cr & KING_SIDE ? WEST : EAST);
+  Square kto = vertical ? kfrom + (c == WHITE ? 2 * NORTH : 2 * SOUTH)
+                        : make_square(cr & KING_SIDE ? castling_kingside_file() : castling_queenside_file(), castling_rank(c));
+  Square rto = vertical ? kfrom + (c == WHITE ? NORTH : SOUTH)
+                        : kto + (cr & KING_SIDE ? WEST : EAST);
 
   castlingPath[cr] =   (between_bb(rfrom, rto) | between_bb(kfrom, kto))
                     & ~(kfrom | rfrom);
@@ -668,6 +719,12 @@ void Position::set_state(StateInfo* si) const {
   if (check_counting())
       for (Color c : {WHITE, BLACK})
           si->key ^= Zobrist::checks[c][si->checksRemaining[c]];
+
+  if (si->lifeDebtTargetKings < COLOR_NB)
+      si->key ^= Zobrist::lifeDebt[si->lifeDebtTargetKings];
+
+  for (Bitboard b = si->lifeMovedPawns; b; )
+      si->key ^= Zobrist::lifeMovedPawn[pop_lsb(b)];
 }
 
 
@@ -779,6 +836,12 @@ string Position::fen(bool sfen, bool showPromoted, int countStarted, std::string
   if (can_castle(WHITE_OOO))
       ss << (chess960 ? char('A' + file_of(castling_rook_square(WHITE_OOO))) : 'Q');
 
+  // The vertical right is a historical right and must survive serialization
+  // before the promoted rook reaches its starting square. can_castle() also
+  // checks whether the rook is currently present and is for move generation.
+  if (st->castlingRights & WHITE_VERTICAL)
+      ss << 'V';
+
   if (gating() && gates(WHITE) && (!seirawan_gating() || count_in_hand(WHITE, ALL_PIECES) > 0 || captures_to_hand()))
       for (File f = FILE_A; f <= max_file(); ++f)
           if (   (gates(WHITE) & file_bb(f))
@@ -798,6 +861,9 @@ string Position::fen(bool sfen, bool showPromoted, int countStarted, std::string
   if (can_castle(BLACK_OOO))
       ss << (chess960 ? char('a' + file_of(castling_rook_square(BLACK_OOO))) : 'q');
 
+  if (st->castlingRights & BLACK_VERTICAL)
+      ss << 'v';
+
   if (gating() && gates(BLACK) && (!seirawan_gating() || count_in_hand(BLACK, ALL_PIECES) > 0 || captures_to_hand()))
       for (File f = FILE_A; f <= max_file(); ++f)
           if (   (gates(BLACK) & file_bb(f))
@@ -807,7 +873,7 @@ string Position::fen(bool sfen, bool showPromoted, int countStarted, std::string
               && !(can_castle(BLACK_OOO) && f == file_of(castling_rook_square(BLACK_OOO))))
               ss << char('a' + f);
 
-  if (!can_castle(ANY_CASTLING) && !(gating() && (gates(WHITE) | gates(BLACK))))
+  if (!(st->castlingRights & ANY_CASTLING) && !(gating() && (gates(WHITE) | gates(BLACK))))
       ss << '-';
 
   // Counting limit or ep-square
@@ -834,6 +900,17 @@ string Position::fen(bool sfen, bool showPromoted, int countStarted, std::string
       ss << st->rule50;
 
   ss << " " << 1 + (gamePly - (sideToMove == BLACK)) / 2;
+
+  if (var->lifeKingPieceType != NO_PIECE_TYPE)
+  {
+      ss << " lc1:";
+      if (st->lifeDebtTargetKings < COLOR_NB)
+          ss << (st->lifeDebtTargetKings == WHITE ? 'w' : 'b');
+      else
+          ss << '-';
+      ss << " lm1:" << std::hex << std::setw(16) << std::setfill('0')
+         << st->lifeMovedPawns << std::dec << std::setfill(' ');
+  }
 
   return ss.str();
 }
@@ -1044,6 +1121,33 @@ Bitboard Position::checked_pseudo_royals(Color c) const {
 }
 
 
+bool Position::life_king_promotion_allowed(Move m) const {
+
+  assert(type_of(m) == PROMOTION);
+  assert(promotion_type(m) == var->lifeKingPieceType);
+
+  Color us = sideToMove;
+  Color them = ~us;
+  Square from = from_sq(m);
+  Square to = to_sq(m);
+  PieceType kingType = var->lifeKingPieceType;
+
+  Bitboard existingKings = pieces(us, kingType);
+  if (!existingKings)
+      return false;
+
+  Bitboard occupied = (pieces() ^ square_bb(from)) | square_bb(to);
+  Bitboard enemyPieces = pieces(them) & ~square_bb(to);
+  while (existingKings)
+  {
+      Square kingSquare = pop_lsb(existingKings);
+      if (attackers_to(kingSquare, occupied, them) & enemyPieces)
+          return true;
+  }
+
+  return false;
+}
+
 /// Position::legal() tests whether a pseudo-legal move is legal
 
 bool Position::legal(Move m) const {
@@ -1055,9 +1159,37 @@ bool Position::legal(Move m) const {
   Square from = from_sq(m);
   Square to = to_sq(m);
 
+  // A malformed or stale en-passant target must not reach capture_square()
+  // without an actual victim behind it.
+  if (type_of(m) == EN_PASSANT && capture_square(to) == SQ_NONE)
+      return false;
+
+  if (life_debt_active())
+  {
+      Square captureSquare = type_of(m) == EN_PASSANT ? capture_square(to) : to;
+      Piece captured = piece_on(captureSquare);
+      if (st->lifeDebtTargetKings != ~us || !captured
+          || color_of(captured) != st->lifeDebtTargetKings
+          || type_of(captured) != var->lifeKingPieceType)
+          return false;
+  }
+
   assert(color_of(moved_piece(m)) == us);
   assert(!count<KING>(us) || piece_on(square<KING>(us)) == make_piece(us, KING));
   assert(board_bb() & to);
+
+  Piece target = piece_on(to);
+  bool debtKingCapture = life_debt_active() && target
+                      && color_of(target) == st->lifeDebtTargetKings
+                      && type_of(target) == var->lifeKingPieceType;
+  if (type_of(m) != CASTLING && target && color_of(target) == us
+      && !(own_capture_types() & type_of(moved_piece(m)))
+      && !debtKingCapture)
+      return false;
+
+  if (type_of(m) == PROMOTION && var->lifeKingPieceType != NO_PIECE_TYPE
+      && promotion_type(m) == var->lifeKingPieceType && !life_king_promotion_allowed(m))
+      return false;
 
   // Illegal checks
   if ((!checking_permitted() || (sittuyin_promotion() && type_of(m) == PROMOTION) || (!drop_checks() && type_of(m) == DROP)) && gives_check(m))
@@ -1239,11 +1371,14 @@ bool Position::legal(Move m) const {
   {
       // After castling, the rook and king final positions are the same in
       // Chess960 as they would be in standard chess.
-      to = make_square(to > from ? castling_kingside_file() : castling_queenside_file(), castling_rank(us));
-      Direction step = to > from ? WEST : EAST;
+      bool vertical = file_of(to) == file_of(from);
+      to = vertical ? from + (us == WHITE ? 2 * NORTH : 2 * SOUTH)
+                    : make_square(to > from ? castling_kingside_file() : castling_queenside_file(), castling_rank(us));
+      Direction step = vertical ? (us == WHITE ? NORTH : SOUTH) : (to > from ? WEST : EAST);
 
       // Will the gate be blocked by king or rook?
-      Square rto = to + (to_sq(m) > from_sq(m) ? WEST : EAST);
+      Square rto = vertical ? from + (us == WHITE ? NORTH : SOUTH)
+                            : to + (to_sq(m) > from_sq(m) ? WEST : EAST);
       if (is_gating(m) && (gating_square(m) == to || gating_square(m) == rto))
           return false;
 
@@ -1370,22 +1505,30 @@ bool Position::pseudo_legal(const Move m) const {
   if (pc == NO_PIECE || color_of(pc) != us)
       return false;
 
-  // The destination square cannot be occupied by a friendly piece
-  if (pieces(us) & to)
+  // Friendly pieces are capturable only by explicitly configured piece types.
+  Piece target = piece_on(to);
+  bool debtKingCapture = life_debt_active() && target
+                      && color_of(target) == st->lifeDebtTargetKings
+                      && type_of(target) == var->lifeKingPieceType;
+  if ((pieces(us) & to) && !(own_capture_types() & type_of(pc))
+      && !debtKingCapture)
       return false;
 
   // Handle the special case of a pawn move
   if (type_of(pc) == PAWN)
   {
+      Bitboard capturablePieces = pieces(~us)
+                                | (debtKingCapture ? square_bb(to) : Bitboard(0));
       // We have already handled promotion moves, so destination
       // cannot be on the 8th/1st rank.
       if (mandatory_pawn_promotion() && (promotion_zone(us) & to) && !sittuyin_promotion())
           return false;
 
-      if (   !(pawn_attacks_bb(us, from) & pieces(~us) & to)     // Not a capture
+      if (   !(pawn_attacks_bb(us, from) & capturablePieces & to) // Not a capture
           && !((from + pawn_push(us) == to) && !(pieces() & to)) // Not a single push
           && !(   (from + 2 * pawn_push(us) == to)               // Not a double push
                && (double_step_region(us) & from)
+               && !(life_moved_pawns() & from)
                && !(pieces() & (to | (to - pawn_push(us)))))
           && !(   (from + 3 * pawn_push(us) == to)               // Not a triple push
                && (triple_step_region(us) & from)
@@ -1525,8 +1668,11 @@ bool Position::gives_check(Move m) const {
       // Castling is encoded as 'king captures the rook'
       Square kfrom = from;
       Square rfrom = to;
-      Square kto = make_square(rfrom > kfrom ? castling_kingside_file() : castling_queenside_file(), castling_rank(sideToMove));
-      Square rto = kto + (rfrom > kfrom ? WEST : EAST);
+      bool vertical = file_of(rfrom) == file_of(kfrom);
+      Square kto = vertical ? kfrom + (sideToMove == WHITE ? 2 * NORTH : 2 * SOUTH)
+                            : make_square(rfrom > kfrom ? castling_kingside_file() : castling_queenside_file(), castling_rank(sideToMove));
+      Square rto = vertical ? kfrom + (sideToMove == WHITE ? NORTH : SOUTH)
+                            : kto + (rfrom > kfrom ? WEST : EAST);
 
       // Is there a discovered check?
       if (   castling_rank(WHITE) > RANK_1
@@ -1592,7 +1738,12 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
   st->pass = is_pass(m);
 
   assert(color_of(pc) == us);
-  assert(captured == NO_PIECE || color_of(captured) == (type_of(m) != CASTLING ? them : us));
+  assert(captured == NO_PIECE || (type_of(m) == CASTLING
+             ? color_of(captured) == us
+             : color_of(captured) == them
+                 || (color_of(captured) == us && (own_capture_types() & type_of(pc)))
+                 || (life_debt_active() && color_of(captured) == st->lifeDebtTargetKings
+                     && type_of(captured) == var->lifeKingPieceType)));
   assert(type_of(captured) != KING);
 
   if (check_counting() && givesCheck)
@@ -1627,9 +1778,17 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
       // If the captured piece is a pawn, update pawn hash key, otherwise
       // update non-pawn material.
       if (type_of(captured) == PAWN)
+      {
           st->pawnKey ^= Zobrist::psq[captured][capsq];
+          if (var->lifeKingPieceType != NO_PIECE_TYPE)
+          {
+              if (st->lifeMovedPawns & square_bb(capsq))
+                  k ^= Zobrist::lifeMovedPawn[capsq];
+              st->lifeMovedPawns &= ~square_bb(capsq);
+          }
+      }
       else
-          st->nonPawnMaterial[them] -= PieceValue[MG][captured];
+          st->nonPawnMaterial[color_of(captured)] -= PieceValue[MG][captured];
 
       if (Eval::useNNUE)
       {
@@ -1703,11 +1862,36 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
   while (st->epSquares)
       k ^= Zobrist::enpassant[file_of(pop_lsb(st->epSquares))];
 
-  // Update castling rights if needed
-  if (type_of(m) != DROP && !is_pass(m) && st->castlingRights && (castlingRightsMask[from] | castlingRightsMask[to]))
+  // Vertical LifeChess rights may refer to a rook that has not appeared yet,
+  // and their rook squares overlap the opponent's king home squares. Track
+  // those rights by the actual participating piece and color, not square alone.
+  CastlingRights verticalRightsToRemove = NO_CASTLING;
+  if (life_vertical_castling() && type_of(m) != DROP && !is_pass(m))
+      for (Color c : {WHITE, BLACK})
+      {
+          CastlingRights cr = c == WHITE ? WHITE_VERTICAL : BLACK_VERTICAL;
+          if (!(st->castlingRights & cr))
+              continue;
+          Square kingFrom = st->castlingKingSquare[c];
+          Square rookFrom = castlingRookSquare[cr];
+          Square capturedSquare = type_of(m) == EN_PASSANT ? capture_square(to) : to;
+          if (   (us == c && from == kingFrom && type_of(pc) == castling_king_piece(c))
+              || (us == c && from == rookFrom && (castling_rook_pieces(c) & type_of(pc)))
+              || (captured && color_of(captured) == c
+                  && (castling_rook_pieces(c) & type_of(captured)) && capturedSquare == rookFrom)
+              || (us == c && to == rookFrom && from != rookFrom
+                  && (castling_rook_pieces(c) & type_of(pc)) && type_of(m) != PROMOTION))
+              verticalRightsToRemove = CastlingRights(verticalRightsToRemove | cr);
+      }
+
+  CastlingRights rightsToRemove = verticalRightsToRemove;
+  if (type_of(m) != DROP && !is_pass(m))
+      rightsToRemove = CastlingRights(rightsToRemove | castlingRightsMask[from]
+                                                     | castlingRightsMask[to]);
+  if (st->castlingRights && rightsToRemove)
   {
       k ^= Zobrist::castling[st->castlingRights];
-      st->castlingRights &= ~(castlingRightsMask[from] | castlingRightsMask[to]);
+      st->castlingRights &= ~rightsToRemove;
 
       // Remove castling rights from opponent on the same side if oppositeCastling
       if ((var->oppositeCastling) && (type_of(m) == CASTLING))
@@ -1819,6 +2003,25 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
   // If the moving piece is a pawn do some special extra work
   if (type_of(pc) == PAWN)
   {
+      if (var->lifeKingPieceType != NO_PIECE_TYPE)
+      {
+          if (st->lifeMovedPawns & square_bb(from))
+              k ^= Zobrist::lifeMovedPawn[from];
+          st->lifeMovedPawns &= ~square_bb(from);
+          if (type_of(m) == PROMOTION || type_of(m) == PIECE_PROMOTION)
+          {
+              if (st->lifeMovedPawns & square_bb(to))
+                  k ^= Zobrist::lifeMovedPawn[to];
+              st->lifeMovedPawns &= ~square_bb(to);
+          }
+          else
+          {
+              if (!(st->lifeMovedPawns & square_bb(to)))
+                  k ^= Zobrist::lifeMovedPawn[to];
+              st->lifeMovedPawns |= square_bb(to);
+          }
+      }
+
       if (type_of(m) == PROMOTION || type_of(m) == PIECE_PROMOTION)
       {
           Piece promotion = make_piece(us, type_of(m) == PROMOTION ? promotion_type(m) : promoted_piece_type(PAWN));
@@ -2090,6 +2293,21 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
   }
 
   // Update the key with the final value
+  Color oldDebt = st->lifeDebtTargetKings;
+  if (captured && oldDebt < COLOR_NB && color_of(captured) == oldDebt
+      && type_of(captured) == var->lifeKingPieceType)
+      st->lifeDebtTargetKings = Color(COLOR_NB);
+
+  bool lifeKingPromotion = type_of(m) == PROMOTION
+                        && promotion_type(m) == var->lifeKingPieceType;
+  if (lifeKingPromotion && count(them, var->lifeKingPieceType) > 0)
+      st->lifeDebtTargetKings = us;
+
+  if (oldDebt < COLOR_NB)
+      k ^= Zobrist::lifeDebt[oldDebt];
+  if (st->lifeDebtTargetKings < COLOR_NB)
+      k ^= Zobrist::lifeDebt[st->lifeDebtTargetKings];
+
   st->key = k;
   // Calculate checkers bitboard (if move gives check)
   st->checkersBB = givesCheck ? attackers_to(square<KING>(them), us) & pieces(us) : Bitboard(0);
@@ -2280,10 +2498,13 @@ void Position::undo_move(Move m) {
 template<bool Do>
 void Position::do_castling(Color us, Square from, Square& to, Square& rfrom, Square& rto) {
 
+  bool vertical = file_of(to) == file_of(from);
   bool kingSide = to > from;
   rfrom = to; // Castling is encoded as "king captures friendly rook"
-  to = make_square(kingSide ? castling_kingside_file() : castling_queenside_file(), castling_rank(us));
-  rto = to + (kingSide ? WEST : EAST);
+  to = vertical ? from + (us == WHITE ? 2 * NORTH : 2 * SOUTH)
+                : make_square(kingSide ? castling_kingside_file() : castling_queenside_file(), castling_rank(us));
+  rto = vertical ? from + (us == WHITE ? NORTH : SOUTH)
+                 : to + (kingSide ? WEST : EAST);
 
   Piece castlingKingPiece = piece_on(Do ? from : to);
   Piece castlingRookPiece = piece_on(Do ? rfrom : rto);
@@ -2473,6 +2694,15 @@ bool Position::see_ge(Move m, Value threshold) const {
   // Only deal with normal moves, assume others pass a simple SEE
   if (type_of(m) != NORMAL && type_of(m) != DROP && type_of(m) != PIECE_PROMOTION)
       return VALUE_ZERO >= threshold;
+
+  // SEE assumes a capture gains material. Keep configured friendly captures
+  // out of SEE pruning until their exchange value is evaluated separately.
+  Piece target = piece_on(to_sq(m));
+  if (target && color_of(target) == sideToMove
+      && ((own_capture_types() & type_of(moved_piece(m)))
+          || (life_debt_active() && color_of(target) == st->lifeDebtTargetKings
+              && type_of(target) == var->lifeKingPieceType)))
+      return true;
 
   Square from = from_sq(m), to = to_sq(m);
 
@@ -3263,6 +3493,14 @@ void Position::flip() {
   std::transform(f.begin(), f.end(), f.begin(),
                  [](char c) { return char(islower(c) ? toupper(c) : tolower(c)); });
 
+  if (st->lifeDebtTargetKings < COLOR_NB)
+  {
+      string currentDebt = st->lifeDebtTargetKings == WHITE ? "lc1:w" : "lc1:b";
+      size_t debtPos = f.find(currentDebt);
+      if (debtPos != string::npos)
+          f.replace(debtPos, currentDebt.size(), st->lifeDebtTargetKings == WHITE ? "lc1:b" : "lc1:w");
+  }
+
   ss >> token; // En passant square
   f += (token == "-" ? token : token.replace(1, 1, token[1] == '3' ? "6" : "3"));
 
@@ -3328,13 +3566,15 @@ bool Position::pos_is_ok() const {
       }
 
   for (Color c : { WHITE, BLACK })
-      for (CastlingRights cr : {c & KING_SIDE, c & QUEEN_SIDE})
+      for (CastlingRights cr : {c & KING_SIDE, c & QUEEN_SIDE, c & VERTICAL_CASTLING})
       {
           if (!can_castle(cr))
               continue;
 
-          if (   !(castling_rook_pieces(c) & type_of(piece_on(castlingRookSquare[cr])))
-              || castlingRightsMask[castlingRookSquare[cr]] != cr
+          bool vertical = cr == WHITE_VERTICAL || cr == BLACK_VERTICAL;
+          if (   (!vertical && (!(castling_rook_pieces(c) & type_of(piece_on(castlingRookSquare[cr])))
+                                || castlingRightsMask[castlingRookSquare[cr]] != cr))
+              || (vertical && (castlingRightsMask[castlingRookSquare[cr]] & cr))
               || (count<KING>(c) && (castlingRightsMask[square<KING>(c)] & cr) != cr))
               assert(0 && "pos_is_ok: Castling");
       }

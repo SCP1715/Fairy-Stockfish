@@ -457,6 +457,23 @@ namespace {
         v->extinctionPieceTypes = piece_set(COMMONER) | QUEEN | ROOK | BISHOP | KNIGHT | PAWN;
         return v;
     }
+    // LifeChess: capturable kings represented by the non-royal commoner.
+    Variant* lifechess_variant() {
+        Variant* v = chess_variant_base()->init();
+        v->remove_piece(KING);
+        v->add_piece(COMMONER, 'k');
+        v->castlingKingPiece[WHITE] = v->castlingKingPiece[BLACK] = COMMONER;
+        v->ownCaptureTypes = piece_set(COMMONER);
+        v->lifeKingPieceType = COMMONER;
+        v->promotionPieceTypes[WHITE] = piece_set(COMMONER) | QUEEN | ROOK | BISHOP | KNIGHT;
+        v->promotionPieceTypes[BLACK] = piece_set(COMMONER) | QUEEN | ROOK | BISHOP | KNIGHT;
+        v->lifeVerticalCastling = true;
+        v->lifeDrawClaims = true;
+        v->extinctionValue = -VALUE_MATE;
+        v->extinctionPieceTypes = piece_set(COMMONER);
+        v->startFen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkqVv - 0 1";
+        return v;
+    }
     // Kinglet
     // https://en.wikipedia.org/wiki/V._R._Parton#Kinglet_chess
     Variant* kinglet_variant() {
@@ -1881,6 +1898,7 @@ void VariantMap::init() {
     add("suicide", suicide_variant());
     add("codrus", codrus_variant());
     add("extinction", extinction_variant());
+    add("lifechess", lifechess_variant());
     add("kinglet", kinglet_variant());
     add("threekings", threekings_variant());
     add("horde", horde_variant());

@@ -193,6 +193,13 @@ void init(OptionsMap& o) {
   o["UCI_Chess960"]          << Option(false);
   o["UCI_Variant"]           << Option("chess", variants.get_keys(), on_variant_change);
   o["UCI_AnalyseMode"]       << Option(false);
+  // Explicit LifeChess UCI extension; ordinary UCI clients leave these off.
+  o["LifeChess Draw Decisions"] << Option(false);
+  o["LifeChess Draw Offer Pending"] << Option(false);
+  o["LifeChess Draw Claim Available"] << Option(false);
+  o["LifeChess Draw Claim Repetition"] << Option(false);
+  o["LifeChess Draw Claim Fifty Moves"] << Option(false);
+  o["LifeChess Draw Offer Sent"] << Option(false);
   o["UCI_LimitStrength"]     << Option(false);
   o["UCI_Elo"]               << Option(1350, 500, 2850);
   o["UCI_ShowWDL"]           << Option(false);

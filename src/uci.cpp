@@ -523,6 +523,8 @@ string UCI::move(const Position& pos, Move m) {
 
   if (is_gating(m) && gating_square(m) == to)
       from = to_sq(m), to = from_sq(m);
+  else if (type_of(m) == CASTLING && pos.life_vertical_castling() && file_of(to) == file_of(from))
+      to = from + (pos.side_to_move() == WHITE ? 2 * NORTH : 2 * SOUTH);
   else if (type_of(m) == CASTLING && !pos.is_chess960())
   {
       to = make_square(to > from ? pos.castling_kingside_file() : pos.castling_queenside_file(), rank_of(from));

@@ -175,13 +175,18 @@ void StateMachine::process_command(std::string token, std::istringstream& is) {
       for (std::string v : variants.get_keys())
           if (v != "chess")
               vars += "," + v;
-      sync_cout << "feature setboard=1 usermove=1 time=1 memory=1 smp=1 colors=0 draw=0 "
+      sync_cout << "feature setboard=1 usermove=1 time=1 memory=1 smp=1 colors=0 draw=1 "
                 << "highlight=1 name=0 sigint=0 ping=1 myname=\""
                 << engine_info(false, true) << "\" " << "variants=\"" << vars << "\""
                 << Options << sync_endl;
       sync_cout << "feature done=1" << sync_endl;
   }
   else if (token == "accepted" || token == "rejected") {}
+  else if (token == "draw")
+  {
+      if (pos.variant()->lifeDrawClaims && !Options["UCI_AnalyseMode"])
+          drawOfferPending.store(true);
+  }
   else if (token == "hover" || token == "put") {}
   else if (token == "lift")
   {
@@ -227,6 +232,8 @@ void StateMachine::process_command(std::string token, std::istringstream& is) {
       stop();
       Search::clear();
       setboard();
+      drawOfferPending.store(false);
+      drawOfferSent = false;
       // play second by default
       playColor = ~pos.side_to_move();
       Threads.sit = false;
