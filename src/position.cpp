@@ -46,9 +46,36 @@ namespace Zobrist {
   Key checks[COLOR_NB][CHECKS_NB];
   Key lifeDebt[COLOR_NB];
   Key lifeMovedPawn[SQUARE_NB];
+  Key lifeCastlingCaptureTarget[SQUARE_NB];
+  Key lifeCastlingCaptureKingSquare[SQUARE_NB];
+  Key lifeCastlingCaptureAttacker[SQUARE_NB];
   Key wall[SQUARE_NB];
   Key endgame[EG_EVAL_NB];
 }
+
+namespace {
+
+Key life_castling_capture_key(const StateInfo& state) {
+  if (!is_ok(state.lifeCastlingCaptureTarget)
+      || !is_ok(state.lifeCastlingCaptureKingSquare)
+      || !state.lifeCastlingCaptureAttackers)
+      return 0;
+
+  Key key = Zobrist::lifeCastlingCaptureTarget[state.lifeCastlingCaptureTarget]
+          ^ Zobrist::lifeCastlingCaptureKingSquare[state.lifeCastlingCaptureKingSquare];
+  for (Bitboard attackers = state.lifeCastlingCaptureAttackers; attackers;)
+      key ^= Zobrist::lifeCastlingCaptureAttacker[pop_lsb(attackers)];
+  return key;
+}
+
+Square parse_life_square(const string& square) {
+  if (square.size() != 2 || square[0] < 'a' || square[0] > 'h'
+      || square[1] < '1' || square[1] > '8')
+      return SQ_NONE;
+  return make_square(File(square[0] - 'a'), Rank(square[1] - '1'));
+}
+
+} // namespace
 
 
 /// operator<<(Position) returns an ASCII representation of the position
@@ -180,6 +207,13 @@ void Position::init() {
   for (Square s = SQ_A1; s <= SQ_MAX; ++s)
       Zobrist::lifeMovedPawn[s] = rng.rand<Key>();
 
+  for (Square s = SQ_A1; s <= SQ_MAX; ++s)
+  {
+      Zobrist::lifeCastlingCaptureTarget[s] = rng.rand<Key>();
+      Zobrist::lifeCastlingCaptureKingSquare[s] = rng.rand<Key>();
+      Zobrist::lifeCastlingCaptureAttacker[s] = rng.rand<Key>();
+  }
+
   for (Color c : {WHITE, BLACK})
       for (int n = 0; n < CHECKS_NB; ++n)
           Zobrist::checks[c][n] = rng.rand<Key>();
@@ -281,6 +315,10 @@ Position& Position::set(const Variant* v, const string& fenStr, bool isChess960,
   std::memset(si, 0, sizeof(StateInfo));
   st = si;
   st->lifeDebtTargetKings = Color(COLOR_NB);
+  st->lifeCastlingCaptureTarget = SQ_NONE;
+  st->lifeCastlingCaptureKingSquare = SQ_NONE;
+  st->lifeCastlingCapturedPiece = NO_PIECE;
+  st->lifeCastlingCapturedSquare = SQ_NONE;
 
   var = v;
 
@@ -562,6 +600,36 @@ Position& Position::set(const Variant* v, const string& fenStr, bool isChess960,
               st->lifeMovedPawns = 0;
           }
       }
+
+      string castlingCapture;
+      if (ss >> castlingCapture && castlingCapture.compare(0, 5, "lcc1:") == 0
+          && castlingCapture != "lcc1:-")
+      {
+          const size_t first = castlingCapture.find(':', 5);
+          const size_t second = first == string::npos ? string::npos
+                                                       : castlingCapture.find(':', first + 1);
+          Square target = first == string::npos ? SQ_NONE
+              : parse_life_square(castlingCapture.substr(5, first - 5));
+          Square kingSquare = second == string::npos ? SQ_NONE
+              : parse_life_square(castlingCapture.substr(first + 1, second - first - 1));
+          const string attackers = second == string::npos ? string()
+              : castlingCapture.substr(second + 1);
+          std::istringstream attackersValue(attackers);
+          unsigned long long mask = 0;
+          attackersValue >> std::hex >> mask;
+          if (is_ok(target) && is_ok(kingSquare) && target != kingSquare
+              && attackers.size() == 16 && attackersValue && attackersValue.eof() && mask)
+          {
+              st->lifeCastlingCaptureTarget = target;
+              st->lifeCastlingCaptureKingSquare = kingSquare;
+              st->lifeCastlingCaptureAttackers = Bitboard(mask);
+          }
+          else
+          {
+              std::cerr << "Invalid LifeChess castling-capture FEN extension: "
+                        << castlingCapture << '\n';
+          }
+      }
   }
 
   // counting rules
@@ -725,6 +793,8 @@ void Position::set_state(StateInfo* si) const {
 
   for (Bitboard b = si->lifeMovedPawns; b; )
       si->key ^= Zobrist::lifeMovedPawn[pop_lsb(b)];
+
+  si->key ^= life_castling_capture_key(*si);
 }
 
 
@@ -910,6 +980,15 @@ string Position::fen(bool sfen, bool showPromoted, int countStarted, std::string
           ss << '-';
       ss << " lm1:" << std::hex << std::setw(16) << std::setfill('0')
          << st->lifeMovedPawns << std::dec << std::setfill(' ');
+      ss << " lcc1:";
+      if (is_ok(st->lifeCastlingCaptureTarget)
+          && st->lifeCastlingCaptureAttackers)
+          ss << UCI::square(*this, st->lifeCastlingCaptureTarget) << ':'
+             << UCI::square(*this, st->lifeCastlingCaptureKingSquare) << ':'
+             << std::hex << std::setw(16) << std::setfill('0')
+             << st->lifeCastlingCaptureAttackers << std::dec << std::setfill(' ');
+      else
+          ss << '-';
   }
 
   return ss.str();
@@ -1168,9 +1247,12 @@ bool Position::legal(Move m) const {
   {
       Square captureSquare = type_of(m) == EN_PASSANT ? capture_square(to) : to;
       Piece captured = piece_on(captureSquare);
+      bool castlingCapturePaysDebt = life_castling_capture(m)
+                                  && st->lifeDebtTargetKings == ~us;
       if (st->lifeDebtTargetKings != ~us || !captured
-          || color_of(captured) != st->lifeDebtTargetKings
-          || type_of(captured) != var->lifeKingPieceType)
+          || (!castlingCapturePaysDebt
+              && (color_of(captured) != st->lifeDebtTargetKings
+                  || type_of(captured) != var->lifeKingPieceType)))
           return false;
   }
 
@@ -1180,8 +1262,10 @@ bool Position::legal(Move m) const {
 
   Piece target = piece_on(to);
   bool debtKingCapture = life_debt_active() && target
-                      && color_of(target) == st->lifeDebtTargetKings
-                      && type_of(target) == var->lifeKingPieceType;
+                      && ((color_of(target) == st->lifeDebtTargetKings
+                           && type_of(target) == var->lifeKingPieceType)
+                          || (life_castling_capture(m)
+                              && st->lifeDebtTargetKings == ~us));
   if (type_of(m) != CASTLING && target && color_of(target) == us
       && !(own_capture_types() & type_of(moved_piece(m)))
       && !debtKingCapture)
@@ -1508,8 +1592,10 @@ bool Position::pseudo_legal(const Move m) const {
   // Friendly pieces are capturable only by explicitly configured piece types.
   Piece target = piece_on(to);
   bool debtKingCapture = life_debt_active() && target
-                      && color_of(target) == st->lifeDebtTargetKings
-                      && type_of(target) == var->lifeKingPieceType;
+                      && ((color_of(target) == st->lifeDebtTargetKings
+                           && type_of(target) == var->lifeKingPieceType)
+                          || (life_castling_capture(m)
+                              && st->lifeDebtTargetKings == ~us));
   if ((pieces(us) & to) && !(own_capture_types() & type_of(pc))
       && !debtKingCapture)
       return false;
@@ -1698,7 +1784,9 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
 #ifndef NO_THREADS
   thisThread->nodes.fetch_add(1, std::memory_order_relaxed);
 #endif
-  Key k = st->key ^ Zobrist::side;
+  const bool lifeKingCapture = life_castling_capture(m);
+  const Square lifeKingCaptureSquare = lifeKingCapture ? st->lifeCastlingCaptureKingSquare : SQ_NONE;
+  Key k = st->key ^ Zobrist::side ^ life_castling_capture_key(*st);
 
   // Copy some fields of the old state to our new StateInfo object except the
   // ones which are going to be recalculated from scratch anyway and then switch
@@ -1707,6 +1795,11 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
   newSt.previous = st;
   st = &newSt;
   st->move = m;
+  st->lifeCastlingCaptureTarget = SQ_NONE;
+  st->lifeCastlingCaptureKingSquare = SQ_NONE;
+  st->lifeCastlingCaptureAttackers = 0;
+  st->lifeCastlingCapturedPiece = NO_PIECE;
+  st->lifeCastlingCapturedSquare = SQ_NONE;
 
   // Increment ply counters. In particular, rule50 will be reset to zero later on
   // in case of a capture or a pawn move.
@@ -1728,6 +1821,10 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
   Square to = to_sq(m);
   Piece pc = moved_piece(m);
   Piece captured = piece_on(type_of(m) == EN_PASSANT ? capture_square(to) : to);
+  Piece lifeKingCaptured = lifeKingCapture ? piece_on(lifeKingCaptureSquare) : NO_PIECE;
+  assert(!lifeKingCapture || (lifeKingCaptured
+         && color_of(lifeKingCaptured) == them
+         && type_of(lifeKingCaptured) == var->lifeKingPieceType));
   if (to == from)
   {
       assert((type_of(m) == PROMOTION && sittuyin_promotion()) || (is_pass(m) && (pass(us) || var->wallOrMove )));
@@ -1754,8 +1851,24 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
       assert(type_of(pc) != NO_PIECE_TYPE);
       assert(castling_rook_pieces(us) & type_of(captured));
 
+      bool vertical = file_of(to) == file_of(from);
+      Square kingTo = vertical ? from + (us == WHITE ? 2 * NORTH : 2 * SOUTH)
+                               : make_square(to > from ? castling_kingside_file()
+                                                       : castling_queenside_file(), castling_rank(us));
+      Square rookTo = vertical ? from + (us == WHITE ? NORTH : SOUTH)
+                               : kingTo + (to > from ? WEST : EAST);
+      Bitboard captureAttackers = var->lifeKingPieceType != NO_PIECE_TYPE
+          ? attackers_to(rookTo, them) & pieces(them) : Bitboard(0);
+
       Square rfrom, rto;
       do_castling<true>(us, from, to, rfrom, rto);
+
+      if (captureAttackers)
+      {
+          st->lifeCastlingCaptureTarget = rto;
+          st->lifeCastlingCaptureKingSquare = to;
+          st->lifeCastlingCaptureAttackers = captureAttackers;
+      }
 
       k ^= Zobrist::psq[captured][rfrom] ^ Zobrist::psq[captured][rto];
       captured = NO_PIECE;
@@ -1831,6 +1944,25 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
 #endif
       // Reset rule 50 counter
       st->rule50 = 0;
+  }
+
+  if (lifeKingCaptured)
+  {
+      st->lifeCastlingCapturedPiece = lifeKingCaptured;
+      st->lifeCastlingCapturedSquare = lifeKingCaptureSquare;
+      remove_piece(lifeKingCaptureSquare);
+      board[lifeKingCaptureSquare] = NO_PIECE;
+      st->nonPawnMaterial[color_of(lifeKingCaptured)] -= PieceValue[MG][lifeKingCaptured];
+      k ^= Zobrist::psq[lifeKingCaptured][lifeKingCaptureSquare];
+      st->materialKey ^= Zobrist::psq[lifeKingCaptured][pieceCount[lifeKingCaptured]];
+      st->rule50 = 0;
+      if (Eval::useNNUE)
+      {
+          dp.piece[dp.dirty_num] = lifeKingCaptured;
+          dp.from[dp.dirty_num] = lifeKingCaptureSquare;
+          dp.to[dp.dirty_num] = SQ_NONE;
+          dp.dirty_num++;
+      }
   }
 
   // Update hash key
@@ -2294,8 +2426,11 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
 
   // Update the key with the final value
   Color oldDebt = st->lifeDebtTargetKings;
-  if (captured && oldDebt < COLOR_NB && color_of(captured) == oldDebt
-      && type_of(captured) == var->lifeKingPieceType)
+  if (oldDebt < COLOR_NB
+      && ((captured && color_of(captured) == oldDebt
+           && type_of(captured) == var->lifeKingPieceType)
+          || (lifeKingCaptured && color_of(lifeKingCaptured) == oldDebt
+              && type_of(lifeKingCaptured) == var->lifeKingPieceType)))
       st->lifeDebtTargetKings = Color(COLOR_NB);
 
   bool lifeKingPromotion = type_of(m) == PROMOTION
@@ -2308,6 +2443,7 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
   if (st->lifeDebtTargetKings < COLOR_NB)
       k ^= Zobrist::lifeDebt[st->lifeDebtTargetKings];
 
+  k ^= life_castling_capture_key(*st);
   st->key = k;
   // Calculate checkers bitboard (if move gives check)
   st->checkersBB = givesCheck ? attackers_to(square<KING>(them), us) & pieces(us) : Bitboard(0);
@@ -2470,6 +2606,8 @@ void Position::undo_move(Move m) {
                                                                                                    : make_piece(~color_of(st->capturedPiece), main_promotion_pawn_type(us)))
                                                                     : ~st->capturedPiece);
       }
+      if (st->lifeCastlingCapturedPiece)
+          put_piece(st->lifeCastlingCapturedPiece, st->lifeCastlingCapturedSquare);
   }
 
   if (flip_enclosed_pieces())
@@ -2543,6 +2681,11 @@ void Position::do_null_move(StateInfo& newSt) {
   newSt.previous = st;
   st = &newSt;
 
+  st->key ^= life_castling_capture_key(*st);
+  st->lifeCastlingCaptureTarget = SQ_NONE;
+  st->lifeCastlingCaptureKingSquare = SQ_NONE;
+  st->lifeCastlingCaptureAttackers = 0;
+
   st->dirtyPiece.dirty_num = 0;
   st->dirtyPiece.piece[0] = NO_PIECE; // Avoid checks in UpdateAccumulator()
   st->accumulator.computed[WHITE] = false;
@@ -2583,6 +2726,9 @@ void Position::undo_null_move() {
 /// en passant and promotions.
 
 Key Position::key_after(Move m) const {
+
+  if (life_castling_capture(m))
+      return st->key;
 
   Square from = from_sq(m);
   Square to = to_sq(m);
@@ -2690,6 +2836,9 @@ Value Position::blast_see(Move m) const {
 bool Position::see_ge(Move m, Value threshold) const {
 
   assert(is_ok(m));
+
+  if (life_castling_capture(m))
+      return true;
 
   // Only deal with normal moves, assume others pass a simple SEE
   if (type_of(m) != NORMAL && type_of(m) != DROP && type_of(m) != PIECE_PROMOTION)

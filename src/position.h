@@ -53,6 +53,11 @@ struct StateInfo {
   int    countingLimit;
   Color  lifeDebtTargetKings;
   Bitboard lifeMovedPawns;
+  Square lifeCastlingCaptureTarget;
+  Square lifeCastlingCaptureKingSquare;
+  Bitboard lifeCastlingCaptureAttackers;
+  Piece  lifeCastlingCapturedPiece;
+  Square lifeCastlingCapturedSquare;
   CheckCount checksRemaining[COLOR_NB];
   Bitboard epSquares;
   Square castlingKingSquare[COLOR_NB];
@@ -290,6 +295,7 @@ public:
   bool life_king_promotion_allowed(Move m) const;
   bool life_debt_active() const;
   Color life_debt_target_kings() const;
+  bool life_castling_capture(Move m) const;
   bool lifechess_bare_kings_claimable() const;
   bool virtual_drop(Move m) const;
   bool capture(Move m) const;
@@ -1587,6 +1593,17 @@ inline bool Position::life_debt_active() const {
 
 inline Color Position::life_debt_target_kings() const {
   return st->lifeDebtTargetKings;
+}
+
+inline bool Position::life_castling_capture(Move m) const {
+  return is_ok(st->lifeCastlingCaptureTarget)
+      && is_ok(st->lifeCastlingCaptureKingSquare)
+      && to_sq(m) == st->lifeCastlingCaptureTarget
+      && (st->lifeCastlingCaptureAttackers & from_sq(m))
+      && piece_on(st->lifeCastlingCaptureTarget)
+             == make_piece(~sideToMove, ROOK)
+      && piece_on(st->lifeCastlingCaptureKingSquare)
+             == make_piece(~sideToMove, var->lifeKingPieceType);
 }
 
 inline bool Position::lifechess_bare_kings_claimable() const {

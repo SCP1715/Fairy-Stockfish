@@ -322,6 +322,62 @@ if {[string first "e1e3" $output] >= 0} {
   exit 1
 }
 
+# T14: an attacked transit square lets its original attacker take the rook and king.
+send "position fen 3q3k/8/8/8/8/8/8/R3K3 w Q - 0 1 moves e1c1\nd\n"
+expect -re {Fen: 3q3k/8/8/8/8/8/8/2KR4 b - - 1 1 .*lcc1:d1:c1:0800000000000000} {} timeout {
+  puts stderr "T14 failed: queenside castling did not preserve the d1 attacker"
+  exit 1
+}
+set output [perft "3q3k/8/8/8/8/8/8/2KR4 b - - 1 1 lc1:- lm1:0000000000000000 lcc1:d1:c1:0800000000000000"]
+if {[string first "d8d1: 1" $output] < 0} {
+  puts stderr "T14 failed: saved attacker could not capture the rook and king"
+  exit 1
+}
+send "position fen 3q3k/8/8/8/8/8/8/2KR4 b - - 1 1 lc1:- lm1:0000000000000000 lcc1:d1:c1:0800000000000000 moves d8d1\nd\n"
+expect -re {Fen: 7k/8/8/8/8/8/8/3q4 w - - 0 2 .*lcc1:-} {} timeout {
+  puts stderr "T14 failed: double capture did not remove the last king and rook"
+  exit 1
+}
+send "go depth 1\n"
+expect -re {bestmove (\(none\)|0000)} {} timeout {
+  puts stderr "T14 failed: double capture did not end the game"
+  exit 1
+}
+
+# The right expires after another move; an attack on e1 alone creates none.
+send "position fen 3q3k/8/8/8/8/8/8/2KR4 b - - 1 1 lc1:- lm1:0000000000000000 lcc1:d1:c1:0800000000000000 moves d8d7\nd\n"
+expect -re {Fen: 7k/3q4/8/8/8/8/8/2KR4 w - - 2 2 .*lcc1:-} {} timeout {
+  puts stderr "T14 failed: the special capture right did not expire after a move"
+  exit 1
+}
+send "position fen 4r2k/8/8/8/8/8/8/R3K3 w Q - 0 1 moves e1c1\nd\n"
+expect -re {Fen: 4r2k/8/8/8/8/8/8/2KR4 b - - 1 1 .*lcc1:-} {} timeout {
+  puts stderr "T14 failed: an attack on the king's starting square created a capture right"
+  exit 1
+}
+
+# The same double capture works for both vertical castling directions.
+send "position fen 4R2k/8/8/8/8/8/q7/4K3 w V - 0 1 moves e1e3\nd\n"
+expect -re {Fen: 7k/8/8/8/8/4K3/q3R3/8 b - - 1 1 .*lcc1:e2:e3:0000000000000100} {} timeout {
+  puts stderr "T14 failed: white vertical castling did not preserve the a2 attacker"
+  exit 1
+}
+set output [perft "7k/8/8/8/8/4K3/q3R3/8 b - - 1 1 lc1:- lm1:0000000000000000 lcc1:e2:e3:0000000000000100"]
+if {[string first "a2e2: 1" $output] < 0} {
+  puts stderr "T14 failed: white vertical double capture was not generated"
+  exit 1
+}
+send "position fen 4k3/Q7/8/8/8/8/8/4r2K b v - 0 1 moves e8e6\nd\n"
+expect -re {Fen: 8/Q3r3/4k3/8/8/8/8/7K w - - 1 2 .*lcc1:e7:e6:0001000000000000} {} timeout {
+  puts stderr "T14 failed: black vertical castling did not preserve the a7 attacker"
+  exit 1
+}
+set output [perft "8/Q3r3/4k3/8/8/8/8/7K w - - 1 2 lc1:- lm1:0000000000000000 lcc1:e7:e6:0001000000000000"]
+if {[string first "a7e7: 1" $output] < 0} {
+  puts stderr "T14 failed: black vertical double capture was not generated"
+  exit 1
+}
+
 # T13: claimable 50-move and repetition thresholds must not auto-end search.
 send "position fen 7k/8/8/8/8/8/8/K6R w - - 100 51\ngo depth 1\n"
 expect -re {bestmove [a-h][1-8][a-h][1-8]} {} timeout {
